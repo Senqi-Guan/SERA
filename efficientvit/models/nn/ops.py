@@ -7,8 +7,7 @@ import numpy as np
 from efficientvit.models.nn.act import build_act
 from efficientvit.models.nn.norm import build_norm
 from efficientvit.models.utils import get_same_padding, list_sum, resize, val2list, val2tuple
-# import torch_dct as dct
-# from my_some_test import get_list_dimensions
+
 __all__ = [
     "ConvLayer",
     "UpSampleLayer",
