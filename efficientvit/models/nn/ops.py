@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +7,7 @@ import numpy as np
 from efficientvit.models.nn.act import build_act
 from efficientvit.models.nn.norm import build_norm
 from efficientvit.models.utils import get_same_padding, list_sum, resize, val2list, val2tuple
+# import torch_dct as dct
 # from my_some_test import get_list_dimensions
 __all__ = [
     "ConvLayer",
@@ -326,9 +326,8 @@ class ResBlock(nn.Module):
         x = self.conv2(x)
         return x
 
-
 class LiteMLA(nn.Module):
-    r"""Lightweight multi-scale linear attention"""
+    r"""Lightweight MLA with Learnable Energy-Driven Routing (Only 2 Params Added)"""
 
     def __init__(
         self,
@@ -346,8 +345,8 @@ class LiteMLA(nn.Module):
     ):
         super(LiteMLA, self).__init__()
         self.eps = eps
-        heads = heads or int(in_channels // dim * heads_ratio)
 
+        heads = heads or int(in_channels // dim * heads_ratio)
         total_dim = heads * dim
 
         use_bias = val2tuple(use_bias, 2)
@@ -355,122 +354,151 @@ class LiteMLA(nn.Module):
         act_func = val2tuple(act_func, 2)
 
         self.dim = dim
-
-        self.latent_dim = in_channels // 2
-        self.mid_dim = in_channels // 4
+        self.heads = heads
+        
+        self.qkv = ConvLayer(
+            in_channels,
+            3 * total_dim,
+            1,
+            use_bias=use_bias[0],
+            norm=norm[0],
+            act_func=act_func[0],
+        )
         self.aggreg = nn.ModuleList(
             [
                 nn.Sequential(
                     nn.Conv2d(
-                        3 * self.latent_dim,
-                        3 * self.latent_dim,
+                        3 * total_dim,
+                        3 * total_dim,
                         scale,
                         padding=get_same_padding(scale),
-                        groups=3 * self.latent_dim,
+                        groups=3 * total_dim,
                         bias=use_bias[0],
                     ),
-                    nn.Conv2d(3 * self.latent_dim, 3 * self.latent_dim, 1, groups=3 * heads, bias=use_bias[0]),
+                    nn.Conv2d(3 * total_dim, 3 * total_dim, 1, groups=3 * heads, bias=use_bias[0]),
                 )
                 for scale in scales
             ]
         )
         self.kernel_func = build_act(kernel_func, inplace=False)
 
-        self.global_pool = nn.AdaptiveAvgPool2d(1)#全局平均池化
-
-        self.weight_generator1 = nn.Linear(self.latent_dim*2, self.latent_dim // 4)
-        self.weight_generator2 = nn.Linear(self.latent_dim // 4, self.latent_dim * 2)
-
-        self.sigmoid = nn.Sigmoid()
-
-        self.scale = nn.Parameter(torch.zeros(size=(1, 1, 1, dim)))##faltten要用到的scale
-
-        self.act = nn.ReLU6()
-      
-        self.pointwise_down = nn.Conv2d(in_channels=in_channels,out_channels=self.mid_dim,kernel_size=1,bias=use_bias)
-        self.pointwise_up = nn.Conv2d(in_channels=self.mid_dim,out_channels=3*self.latent_dim,kernel_size=1,bias=use_bias)
-
+        proj_in_dim = total_dim * (1 + len(scales))
         self.proj = ConvLayer(
-            # total_dim * (1 + len(scales)),
-            self.latent_dim * (1 + len(scales)),
+            proj_in_dim, 
             out_channels,
             1,
             use_bias=use_bias[1],
             norm=norm[1],
             act_func=act_func[1],
         )
+        
+        self.scale = nn.Parameter(torch.zeros(size=(1, 1, 1, dim)))
+        self.act = nn.ReLU6()
 
+        self.freq_thresh = nn.Parameter(torch.tensor(0.5))
+        
+        self.routing_temp = nn.Parameter(torch.tensor(2.0))
+
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        # self.weight_generator = nn.Linear(in_channels*2, 1)
+        self.weight_generator1 = nn.Linear(in_channels*2, in_channels // 4)
+        self.weight_generator2 = nn.Linear(in_channels // 4, in_channels * 2)
+        self.sigmoid = nn.Sigmoid()
+
+
+    def get_dynamic_weights(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        
+        x_probe = x[:, :1, :, :].mean(dim=1, keepdim=True) # [B, 1, H, W]
+        
+        x_fft = torch.fft.fft2(x_probe, dim=(-2, -1))
+        x_fft_shifted = torch.fft.fftshift(x_fft)
+        mag = torch.abs(x_fft_shifted) 
+
+        c_h, c_w = max(1, H // 4), max(1, W // 4)
+        start_h, end_h = H // 2 - c_h // 2, H // 2 + c_h // 2
+        start_w, end_w = W // 2 - c_w // 2, W // 2 + c_w // 2
+        
+        low_freq_energy = mag[:, :, start_h:end_h, start_w:end_w].sum(dim=(-1, -2), keepdim=True)
+        total_energy = mag.sum(dim=(-1, -2), keepdim=True) + self.eps
+        r = low_freq_energy / total_energy # [B, 1, 1, 1]
+        
+        temp = F.softplus(self.routing_temp) + 0.1 
+        
+        thresh = torch.sigmoid(self.freq_thresh)
+        
+        logit = (r - thresh) * temp
+        w_star = torch.sigmoid(logit)
+        w_linear = 1.0 - w_star
+        
+        w_star = w_star * 0.6 + 0.4
+        w_linear = w_linear * 0.6 + 0.4
+
+        return w_star, w_linear
 
     @autocast(enabled=False)
     def relu_linear_att(self, qkv: torch.Tensor) -> torch.Tensor:
-        # print(qkv.shape)
         B, _, H, W = list(qkv.size())
 
         if qkv.dtype == torch.float16:
             qkv = qkv.float()
 
-        qkv = torch.reshape(
-            qkv,
-            (
-                B,
-                -1,
-                3 * self.dim,
-                H * W,
-            ),
-        )
+        w_star, w_linear = self.get_dynamic_weights(qkv)
+
+        qkv = torch.reshape(qkv, (B, -1, 3 * self.dim, H * W))
         qkv = torch.transpose(qkv, -1, -2)
         q, k, v = (
             qkv[..., 0 : self.dim],
             qkv[..., self.dim : 2 * self.dim],
             qkv[..., 2 * self.dim :],
         )
-       
-        scale = nn.Softplus()(self.scale)
         q = self.kernel_func(q) + 1e-6
         k = self.kernel_func(k) + 1e-6
+        # --- Star Branch ---
+        star_branch = self.act(q) * k
+        star_branch = torch.transpose(star_branch, -1, -2)
+        star_branch = torch.reshape(star_branch, (B, -1, H, W))
+        # --- Linear Branch ---
+        scale = nn.Softplus()(self.scale)
+        q2 = q / scale
+        k2 = k / scale
+        q_norm = q2.norm(dim=-2, keepdim=True)
+        k_norm = k2.norm(dim=-2, keepdim=True)
+        q2 = q2 ** 3
+        k2 = k2 ** 3
+        q2 = (q2 / q2.norm(dim=-2, keepdim=True)) * q_norm
+        k2 = (k2 / k2.norm(dim=-2, keepdim=True)) * k_norm
 
-        q = q / scale
-        k = k / scale
-        q_norm = q.norm(dim=-2, keepdim=True)
-        k_norm = k.norm(dim=-2, keepdim=True)
-        q = q ** 3
-        k = k ** 3
-        q = (q / q.norm(dim=-2, keepdim=True)) * q_norm
-        k = (k / k.norm(dim=-2, keepdim=True)) * k_norm
-        trans_k = k.transpose(-1, -2)
-        v_padded = F.pad(v, (0, 1), mode="constant", value=1)
-        kv = torch.matmul(trans_k, v_padded)
-        out = torch.matmul(q, kv)
-        out = out[..., :-1] / (out[..., -1:] + self.eps)
-        out = torch.transpose(out, -1, -2)
-        out = torch.reshape(out, (B, -1, H, W))
-       
-        bn,cn,hn,wn = out.shape
-        pooled_linear = self.global_pool(out).view(bn,cn)
-      
-        weights1 = self.sigmoid(self.weight_generator2(self.sigmoid(self.weight_generator1(pooled_linear))))
-      
-        out = out * weights1.view(bn,cn,1,1)
+        trans_k2 = k2.transpose(-1, -2)
+        v_padded2 = F.pad(v, (0, 1), mode="constant", value=1)
+        kv2 = torch.matmul(trans_k2, v_padded2)
+        out2 = torch.matmul(q2, kv2)
+        out2 = out2[..., :-1] / (out2[..., -1:] + self.eps)
+        out2 = torch.transpose(out2, -1, -2)
+        out2 = torch.reshape(out2, (B, -1, H, W))
+
+        star_branch = star_branch * w_star #不要频域引导注释这两行
+        out2 = out2 * w_linear
+
+        out = star_branch + out2
+        bn,cn,hn,wn = out.shape 
+        pooled = self.global_pool(out).view(bn, cn)
+        weights = self.sigmoid(self.weight_generator2(self.sigmoid(self.weight_generator1(pooled))))
+        out = out * weights.view(bn,cn,1,1)
+        
         return out
 
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        x = self.pointwise_down(x)
-        x = self.act(x)
-        qkv = self.pointwise_up(x)
-
+        qkv = self.qkv(x)
         multi_scale_qkv = [qkv]
         for op in self.aggreg:
             multi_scale_qkv.append(op(qkv))
-
         multi_scale_qkv = torch.cat(multi_scale_qkv, dim=1)
- 
+        
         out = self.relu_linear_att(multi_scale_qkv)
-
         out = self.proj(out)
-
         return out
+
 
     @staticmethod
     def configure_litemla(model: nn.Module, **kwargs) -> None:
