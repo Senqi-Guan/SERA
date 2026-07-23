@@ -3,8 +3,8 @@
 ### Installation
 
 ```bash
-conda create -n accap python=3.10
-conda activate accap
+conda create -n SERA python=3.10
+conda activate SERA
 conda install -c conda-forge mpi4py openmpi
 pip install -r requirements.txt
 ```
